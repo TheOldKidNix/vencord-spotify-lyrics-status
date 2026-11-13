@@ -17,7 +17,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/hxll/vencord-spotify-lyrics-status.git"
+    "url": "https://github.com/TheOldKidNix/vencord-spotify-lyrics-status.git"
   },
   "scripts": {
     "typecheck": "echo 'Run inside a Vencord source tree: pnpm exec tsc --noEmit -p .' && exit 1"

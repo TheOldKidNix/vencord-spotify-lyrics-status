@@ -1,7 +1,8 @@
 # Spotify Lyrics Status — Vencord plugin
 
 Shows the **current lyric line of the track you're playing on Spotify** as your
-Discord **custom status** (the little text bubble under your name ).
+Discord **custom status** (the little text bubble under your name — not the
+About Me bio).
 
 Synced against playback position, updated within ~250ms of a line changing.
 

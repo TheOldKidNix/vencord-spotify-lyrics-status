@@ -1,0 +1,25 @@
+{
+  "name": "vencord-spotify-lyrics-status",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Show the current Spotify lyric line as your Discord custom status (Vencord plugin)",
+  "license": "MIT",
+  "keywords": [
+    "vencord",
+    "vencord-plugin",
+    "vesktop",
+    "discord",
+    "spotify",
+    "lyrics",
+    "custom-status",
+    "mpris",
+    "lrclib"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hxll/vencord-spotify-lyrics-status.git"
+  },
+  "scripts": {
+    "typecheck": "echo 'Run inside a Vencord source tree: pnpm exec tsc --noEmit -p .' && exit 1"
+  }
+}

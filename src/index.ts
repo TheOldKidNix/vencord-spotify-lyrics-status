@@ -57,6 +57,21 @@ const MAX_STATUS = 128;
 const MIN_WRITE_GAP_MS = 1_000;
 
 /**
+ * Measured: a short burst at 1.2s spacing passes, but SUSTAINED writes at that
+ * rate over a song hit 429 with retry_after up to ~42s. The limit is a rolling
+ * budget, not a fixed interval, so the floor alone cannot keep us under it.
+ *
+ * Two defences:
+ *  - a token bucket that allows a burst but caps the sustained rate, and
+ *  - honouring retry_after exactly instead of a guessed backoff.
+ */
+const WRITE_BUCKET_CAPACITY = 8;      // burst allowance
+const WRITE_BUCKET_REFILL_MS = 5_000; // one token back per 5s -> <=12/min sustained
+
+let bucketTokens = WRITE_BUCKET_CAPACITY;
+let bucketUpdatedAt = Date.now();
+
+/**
  * Between polls we extrapolate the playback position from wall-clock time so
  * the displayed line flips at the right moment instead of up to POLL_MS late.
  */
@@ -249,6 +264,40 @@ function truncate(s: string) {
     return s.length > MAX_STATUS ? s.slice(0, MAX_STATUS - 1) + "…" : s;
 }
 
+/**
+ * RestAPI has no timeout of its own: when Discord's rate limiter queues a
+ * route, the promise can sit unresolved indefinitely. Every call goes through
+ * this so a wedged route degrades to "failed write" instead of a frozen plugin.
+ */
+function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        work.then(
+            v => { clearTimeout(timer); resolve(v); },
+            e => { clearTimeout(timer); reject(e); }
+        );
+    });
+}
+
+/**
+ * Refill the bucket and try to spend one token. Returns 0 when a token is
+ * available, otherwise how long until one is.
+ */
+function takeWriteToken(): number {
+    const now = Date.now();
+    const elapsed = now - bucketUpdatedAt;
+    const refilled = Math.floor(elapsed / WRITE_BUCKET_REFILL_MS);
+    if (refilled > 0) {
+        bucketTokens = Math.min(WRITE_BUCKET_CAPACITY, bucketTokens + refilled);
+        bucketUpdatedAt += refilled * WRITE_BUCKET_REFILL_MS;
+    }
+    if (bucketTokens > 0) {
+        bucketTokens--;
+        return 0;
+    }
+    return WRITE_BUCKET_REFILL_MS - (now - bucketUpdatedAt);
+}
+
 /** The value we want on the profile, even if we cannot write it yet. */
 let pendingText: string | null = null;
 /** Timer that flushes pendingText once the floor allows it. */
@@ -263,46 +312,106 @@ let flushTimer: ReturnType<typeof setTimeout> | undefined;
  * publishing it. The status then showed the previous line until the next line
  * change. Queueing instead of dropping closes that gap.
  */
+/**
+ * Queue `text` for the profile.
+ *
+ * Always keeps the LATEST desired value rather than the first one that had to
+ * wait: a lyric line that arrived while rate-limited is already stale by the
+ * time the window opens, so publishing the newest is what the user expects.
+ */
 function writeStatus(text: string) {
-    if (text === lastWritten) return;
+    if (text === lastWritten && pendingText === null) return;
 
-    const wait = MIN_WRITE_GAP_MS - (Date.now() - lastWriteAt);
-    if (wait > 0) {
-        pendingText = text;
-        if (!flushTimer) {
-            flushTimer = setTimeout(() => {
-                flushTimer = undefined;
-                const t = pendingText;
-                pendingText = null;
-                if (t && t !== lastWritten) void doWrite(t);
-            }, wait);
-        }
+    // Hard floor first — spending a bucket token on a write we cannot make yet
+    // would leak budget for no reason.
+    const floorWait = MIN_WRITE_GAP_MS - (Date.now() - lastWriteAt);
+    if (floorWait > 0) {
+        scheduleFlush(text, floorWait);
+        return;
+    }
+
+    const bucketWait = takeWriteToken();
+    if (bucketWait > 0) {
+        scheduleFlush(text, bucketWait);
         return;
     }
 
     void doWrite(text);
 }
 
+function scheduleFlush(text: string, waitMs: number) {
+    pendingText = text;
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+        flushTimer = undefined;
+        const t = pendingText;
+        pendingText = null;
+        // Re-enter writeStatus so the floor and bucket are re-evaluated; the
+        // world may have changed while we waited.
+        if (t !== null && t !== lastWritten) writeStatus(t);
+    }, waitMs);
+}
+
 async function doWrite(text: string) {
     try {
         if (settings.store.debug) console.log(`[SpotifyLyricsStatus] writing -> "${text}"`);
-        await RestAPI.patch({
-            url: "/users/@me/settings",
-            body: { custom_status: { text: truncate(text) } },
-        });
+        await withTimeout(
+            RestAPI.patch({
+                url: "/users/@me/settings",
+                body: { custom_status: { text: truncate(text) } },
+            }),
+            8_000,
+            "status write"
+        );
         lastWritten = text;
         lastWriteAt = Date.now();
-    } catch (e) {
-        // Back off hard on failure so a 429 doesn't become a tight retry loop.
-        lastWriteAt = Date.now() + 60_000;
-        if (settings.store.debug) console.warn("[SpotifyLyricsStatus] status write FAILED", e);
+    } catch (e: any) {
+        // Honour the server's own retry_after. Guessing (the old fixed 60s) is
+        // both too long when the limit is short and too short when it is long,
+        // and an over-long wait is what made the status freeze mid-song.
+        const retryAfterSec =
+            Number(e?.body?.retry_after) ||
+            Number(e?.retry_after) ||
+            0;
+
+        // Drain the bucket so we do not immediately spend the next token on a
+        // route that just refused us.
+        bucketTokens = 0;
+        bucketUpdatedAt = Date.now();
+
+        // Honour retry_after EXACTLY. Retrying before it expires makes the
+        // penalty worse — Discord extends the window on each attempt that
+        // arrives early. A long wait is the correct behaviour; the fix for
+        // "status looks frozen" is to not hit the limit in the first place
+        // (token bucket), not to ignore the server.
+        const backoffMs = retryAfterSec > 0
+            ? Math.round(retryAfterSec * 1000) + 500
+            : 15_000;
+
+        lastWriteAt = Date.now() + backoffMs;
+
+        // Keep the pending line alive: it will be flushed once the window opens
+        // rather than being lost to the failure.
+        if (pendingText === null && text !== lastWritten) pendingText = text;
+
+        if (settings.store.debug) {
+            console.warn(
+                `[SpotifyLyricsStatus] status write failed after ${backoffMs}ms backoff` +
+                (retryAfterSec ? ` (retry_after ${retryAfterSec}s)` : "") ,
+                e?.status ?? ""
+            );
+        }
     }
 }
 
 async function captureOwnStatus() {
     if (engaged) return;
     try {
-        const me = await RestAPI.get({ url: "/users/@me/settings" });
+        const me = await withTimeout(
+            RestAPI.get({ url: "/users/@me/settings" }),
+            8_000,
+            "own-status capture"
+        );
         const cs = me?.body?.custom_status;
         savedStatus = cs ? { ...cs } : null;
         engaged = true;
@@ -314,10 +423,14 @@ async function captureOwnStatus() {
 async function restoreStatus() {
     if (!settings.store.restoreOnStop || !engaged) return;
     try {
-        await RestAPI.patch({
-            url: "/users/@me/settings",
-            body: { custom_status: savedStatus ?? null },
-        });
+        await withTimeout(
+            RestAPI.patch({
+                url: "/users/@me/settings",
+                body: { custom_status: savedStatus ?? null },
+            }),
+            8_000,
+            "status restore"
+        );
     } catch { /* best effort */ }
     lastWritten = null;
     engaged = false;
@@ -329,6 +442,19 @@ async function restoreStatus() {
  * ------------------------------------------------------------------ */
 
 let currentTrackKey = "";
+
+/**
+ * setInterval does not wait for the previous callback. At POLL_MS with any
+ * awaited network call in the loop, a slow or hanging request lets ticks stack
+ * up — each one starting before the last finished, all of them queueing more
+ * requests. That is how a single stalled GET turns into an unbounded pile of
+ * pending calls that wedges the client's request queue.
+ *
+ * A single in-flight guard fixes it: a tick that finds one running is skipped.
+ */
+let tickInFlight = false;
+/** Guards the one-shot own-status capture so it is only ever attempted once. */
+let captureStarted = false;
 
 /** Last MPRIS sample we trust, used to extrapolate between polls. */
 let lastSample: { artist: string; title: string; position: number; at: number } | null = null;
@@ -361,7 +487,20 @@ function projectedPosition(track: Track): number {
 }
 
 async function tick() {
+    if (tickInFlight) return;
     if (!settings.store.enabled) return;
+
+    tickInFlight = true;
+    try {
+        await tickInner();
+    } catch {
+        /* never let one bad tick kill the loop */
+    } finally {
+        tickInFlight = false;
+    }
+}
+
+async function tickInner() {
 
     const track = await readTrack();
     if (!track) {
@@ -374,7 +513,12 @@ async function tick() {
         return;
     }
 
-    await captureOwnStatus();
+    // Kick the one-time capture but do NOT await it: a slow or wedged
+    // /users/@me/settings GET here would stall every subsequent tick.
+    if (!engaged && !captureStarted) {
+        captureStarted = true;
+        void captureOwnStatus();
+    }
 
     const trackKey = `${track.artist}::${track.title}`;
     const changed = trackKey !== currentTrackKey;
@@ -428,6 +572,10 @@ export default definePlugin({
         currentTrackKey = "";
         lastSample = null;
         pendingText = null;
+        captureStarted = false;
+        tickInFlight = false;
+        bucketTokens = WRITE_BUCKET_CAPACITY;
+        bucketUpdatedAt = Date.now();
         lyricsCache = new Map();
 
         tick().catch(() => { });
